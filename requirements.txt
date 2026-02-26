@@ -1,0 +1,15 @@
+
+langchain>=0.1.0
+langchain-community>=0.0.10
+langchain-huggingface>=0.0.1
+pypdf>=3.17.0
+sentence-transformers>=2.2.2
+faiss-cpu>=1.7.4
+streamlit>=1.30.0
+ctransformers>=0.2.27
+python-dotenv
+torch
+transformers>=4.30.0
+peft>=0.4.0
+bitsandbytes>=0.40.0
+accelerate>=0.21.0
