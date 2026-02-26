@@ -85,5 +85,4 @@ streamlit run app.py
 ---
 
 ### Contact
-Developer: [Your Name/GitHub ID]
-License: MIT
+Developer: 김은우
