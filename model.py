@@ -6,8 +6,9 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 import torch
 from peft import PeftModel, PeftConfig
 import os
+from deep_translator import GoogleTranslator
 
-DB_FAISS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vectorstore/db_faiss")
+DB_FAISS_PATH = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "vectorstore", "db_faiss"))
 
 # 듀얼 페르소나 프롬프트 (Dual Persona Prompts) - Korean Version
 
@@ -16,30 +17,35 @@ DB_FAISS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vector
 
 # 1. 의사 모드 (Doctor Mode): 전문성, 근거 중심, 간결함 (한국어)
 doctor_prompt_template = """[INST] <<SYS>>
-You are an expert AI medical consultant for a pharmaceutical company.
-- You MUST answer in **Korean (한국어)** only.
-- Do NOT use English. content must be fully translated.
-- When asked about new drugs or clinical trials, explain the mechanism of action (MOA) and recent clinical trial results (Advance-HTN, Launch-HTN) clearly.
-- If the answer is not in the context, say "현재 제공된 데이터에는 해당 신약에 대한 정보가 없습니다." in Korean.
+You are an expert English-to-Korean medical translator.
+Your ONLY task is to read the provided [Context] and generate a 100% pure Korean translation and summary answering the [Question].
+Rule 1: NO English words are allowed in your output. You must translate everything.
+Rule 2: Never use Chinese Hanja characters.
 <</SYS>>
 
-Context: {context}
-Question: {question}
+[Context]:
+{context}
 
-Helpful Answer (in detailed Korean): [/INST]"""
+[Question]: {question}
+
+Provide the answer strictly in 100% pure Korean without any English:
+[/INST] 답변: """
 
 # 2. 환자 모드 (Patient Mode): 공감, 쉬운 설명, 안심 (한국어)
 patient_prompt_template = """[INST] <<SYS>>
-You are an AI health assistant for patients.
-- You MUST answer in **Korean (한국어)** only.
-- Do NOT use English. Explain in simple Korean.
-- If the answer is not in the context, say "죄송합니다. 현재 정보로는 답변드리기 어렵습니다. 담당 의사와 상담해주세요." in Korean.
+You are an expert English-to-Korean translator specialized in explaining medicine to patients in simple terms.
+Your ONLY task is to read the provided [Context] and generate a 100% pure, easy Korean translation answering the [Question].
+Rule 1: NO English words are allowed in your output. You must translate everything.
+Rule 2: Never use Chinese Hanja characters.
 <</SYS>>
 
-Context: {context}
-Question: {question}
+[Context]:
+{context}
 
-Helpful Answer (in friendly Korean): [/INST]"""
+[Question]: {question}
+
+Provide the answer strictly in 100% pure, simple Korean without any English:
+[/INST] 답변: """
 
 def get_prompt_template(mode):
     if mode == "Doctor":
@@ -80,9 +86,9 @@ def load_llm():
             model=model,
             tokenizer=tokenizer,
             max_new_tokens=512,
-            temperature=0.7,
+            temperature=0.01, # 거의 0에 가깝게 설정
             top_p=0.95,
-            repetition_penalty=1.15,
+            repetition_penalty=1.3,
             return_full_text=False  # 프롬프트가 답변에 포함되지 않도록 설정
         )
 
@@ -106,22 +112,55 @@ class ManualRAG:
         mode = inputs.get('mode', 'Patient') # 기본값은 환자 모드
         
         # 1. 검색 (Retrieve)
-        # 유사도가 높은 상위 2개 문서 검색
-        docs = self.db.similarity_search(query, k=2)
+        # 질문에 '부작용'이 포함된 경우 side_effects 데이터 위주로 검색되도록 유도 가능하지만
+        # 여기서는 우선 순위 필터링을 로직으로 구현
+        docs_with_scores = self.db.similarity_search_with_score(query, k=5)
         
-        # 2. 문맥 생성 (Context)
-        context = "\n\n".join([doc.page_content for doc in docs])
+        # 2. 관련성 필터링 (Relevance Filtering)
+        # 질문이 부작용에 관한 것이라면 임상 데이터(Lorundrostat 등) 비중을 낮춤
+        is_side_effect_query = any(word in query for word in ["부작용", "합병증", "위험", "안전"])
         
-        # 3. 프롬프트 선택 및 구성 (Augment)
+        filtered_docs = []
+        for doc, score in docs_with_scores:
+            source = doc.metadata.get('source', '')
+            # 부작용 질문 시 임상 데이터는 철저히 배제 (특히 영어 성격이 강한 lorundrostat)
+            if is_side_effect_query and ("lorundrostat" in source.lower() or "clinical" in source.lower()):
+                continue
+            filtered_docs.append(doc)
+            if len(filtered_docs) >= 3:
+                break
+        
+        # 만약 필터링 후 문서가 없다면 최소 1개는 유지 (안전장치)
+        if not filtered_docs and docs_with_scores:
+            filtered_docs = [docs_with_scores[0][0]]
+        
+        # 3. 문맥 생성 (Context)
+        context = "\n\n".join([doc.page_content for doc in filtered_docs])
+        
+        # 4. 프롬프트 선택 및 구성 (Augment)
         prompt_template = get_prompt_template(mode)
         prompt = prompt_template.format(context=context, question=query)
         
-        # 4. 생성 (Generate)
-        response_text = self.llm.invoke(prompt) # invoke 또는 직접 호출
+        # 5. 생성 (Generate)
+        raw_response_text = self.llm.invoke(prompt)
         
+        # 6. 강제 번역 (Force Translation to Korean) - 영어나 한자 누수 방지
+        try:
+            translator = GoogleTranslator(source='auto', target='ko')
+            translated_text = translator.translate(raw_response_text)
+        except Exception as e:
+            print(f"Translation Error: {e}")
+            translated_text = raw_response_text # 번역 실패 시 원본 사용
+            
+        # 7. Prefix 결합
+        prefix = "답변: 질문에 대한 한국어 설명은 다음과 같습니다.\n" if mode == "Doctor" else "답변: 환자분, 궁금하신 사항에 대한 한국어 설명은 다음과 같습니다.\n"
+        final_answer = translated_text.strip()
+        if not final_answer.startswith("답변:"):
+            final_answer = prefix + final_answer
+            
         return {
-            "result": response_text,
-            "source_documents": docs
+            "result": final_answer,
+            "source_documents": filtered_docs
         }
 
 def qa_bot():
