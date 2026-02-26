@@ -1,5 +1,4 @@
 import streamlit as st
-from model import qa_bot
 
 # -----------------------------------------------------------------------------
 # 1. 페이지 설정 (반드시 가장 먼저 호출)
@@ -11,6 +10,16 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
+import os
+import requests
+
+# -----------------------------------------------------------------------------
+# 1. API 설정 (Streamlit Secrets 또는 로컬 환경 변수 확인)
+# -----------------------------------------------------------------------------
+try:
+    API_URL = st.secrets["API_URL"]
+except:
+    API_URL = os.environ.get("API_URL", None)
 # -----------------------------------------------------------------------------
 # 2. 커스텀 CSS 스타일링 (Medical Theme)
 # -----------------------------------------------------------------------------
@@ -122,7 +131,7 @@ with st.sidebar:
     # 대화 초기화 버튼
     if st.button("🗑️ 대화 내용 지우기 (Clear Chat)"):
         st.session_state.messages = []
-        st.experimental_rerun()
+        st.rerun()
 
     # 면책 조항 (Disclaimer) - 제약사 필수
     st.markdown("---")
@@ -179,10 +188,36 @@ for message in st.session_state.messages:
 # 6. 채팅 입력 및 처리 로직
 # -----------------------------------------------------------------------------
 
-# 리소스 캐싱 함수 (모델 로딩 시간 단축 및 메모리 에러 방지)
 @st.cache_resource
 def get_qa_bot():
-    return qa_bot()
+    if not API_URL:
+        # API URL이 없으면 로컬 (GPU가 있는 사용자 PC)에서 직접 모델을 로드 시도
+        try:
+            from model import qa_bot
+            return qa_bot()
+        except Exception as e:
+            st.error(f"로컬 모델 로드 실패: API_URL이 설정되지 않았으며 로컬 실행 환경이 아닙니다. ({e})")
+            return None
+    
+    # API URL이 있으면 클라우드 모드로 작동 (호출용 래퍼 함수 반환)
+    def api_caller(inputs):
+        query = inputs['query']
+        mode = inputs.get('mode', 'Patient')
+        
+        try:
+            response = requests.post(
+                f"{API_URL.rstrip('/')}/chat",
+                json={"query": query, "mode": mode},
+                headers={"Content-Type": "application/json"},
+                timeout=120
+            )
+            response.raise_for_status()
+            data = response.json()
+            return {"result": data["answer"], "source_documents": data.get("sources", [])}
+        except Exception as e:
+            return {"result": f"API 서버 요청 실패: {e}", "source_documents": []}
+            
+    return api_caller
 
 if prompt := st.chat_input("질문을 입력하세요... (예: 고혈압 약 부작용이 뭐야?)"):
     # 1. 사용자 메시지 표시
@@ -204,15 +239,6 @@ if prompt := st.chat_input("질문을 입력하세요... (예: 고혈압 약 부
                 
                 # 답변 표시
                 message_placeholder.markdown(answer)
-                
-                # 출처(Reference) 표시 - Expander로 깔끔하게 정리
-                if sources:
-                    with st.expander("📚 참고 문헌 확인 (Debug: Retrieved Sources)"):
-                        for i, doc in enumerate(sources):
-                            source_name = doc.metadata.get('source', 'Unknown')
-                            page_num = doc.metadata.get('page', 'N/A')
-                            st.markdown(f"**{i+1}. {source_name}**")
-                            st.text(doc.page_content[:300]) # 내용 미리보기 확대
 
         # 3. 대화 기록 저장
         st.session_state.messages.append({"role": "assistant", "content": answer})
